@@ -1,0 +1,90 @@
+name: prune-posted-frames
+
+on:
+  schedule:
+    # 09:07 em São Paulo; evita o pico de carga do início exato da hora.
+    - cron: "7 9 * * *"
+      timezone: "America/Sao_Paulo"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run apenas calcula; execute reescreve o histórico"
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - execute
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prune-posted-frames
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout somente de configuração e metadados
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+
+      - name: Testar proteções da limpeza
+        run: python .github/scripts/test_prune_history.py
+
+      - name: Obter manifesto e estado da meia-noite
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          bot_dir="$RUNNER_TEMP/titanic-frames-bot"
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/mrson93/titanic-frames-bot.git "$bot_dir"
+
+          cutoff="$(TZ=America/Sao_Paulo date --date='today 00:00' --iso-8601=seconds)"
+          state_commit="$(git -C "$bot_dir" rev-list -1 --before="$cutoff" HEAD -- state.json)"
+          test -n "$state_commit"
+
+          git -C "$bot_dir" show HEAD:manifest.json > "$RUNNER_TEMP/manifest.json"
+          git -C "$bot_dir" show "$state_commit":state.json > "$RUNNER_TEMP/cutoff-state.json"
+          git -C "$bot_dir" show HEAD:state.json > "$RUNNER_TEMP/latest-state.json"
+
+          echo "cutoff=$cutoff" >> "$GITHUB_OUTPUT"
+          echo "state_commit=$state_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Planejar ou preparar novo commit raiz
+        id: prune
+        env:
+          EXPECTED_HEAD: ${{ github.sha }}
+          MODE: ${{ github.event_name == 'schedule' && 'execute' || inputs.mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "titanic-frame-cleanup"
+          git config user.email "bot@users.noreply.github.com"
+
+          args=(
+            --manifest "$RUNNER_TEMP/manifest.json"
+            --cutoff-state "$RUNNER_TEMP/cutoff-state.json"
+            --latest-state "$RUNNER_TEMP/latest-state.json"
+            --cutoff "${{ steps.source.outputs.cutoff }}"
+          )
+          if [[ "$MODE" == "execute" ]]; then
+            args+=(--execute)
+          fi
+          python .github/scripts/prune_history.py "${args[@]}"
+
+      - name: Publicar histórico enxuto
+        if: steps.prune.outputs.new_commit != ''
+        env:
+          NEW_COMMIT: ${{ steps.prune.outputs.new_commit }}
+        run: |
+          git push \
+            --force-with-lease=refs/heads/main:${{ github.sha }} \
+            origin "$NEW_COMMIT:refs/heads/main"
